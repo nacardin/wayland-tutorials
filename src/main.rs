@@ -1,15 +1,15 @@
 #[macro_use]
 extern crate wayland_client;
-
 extern crate tempfile;
-
 extern crate byteorder;
+extern crate rand;
+
 use byteorder::{NativeEndian, WriteBytesExt};
-use std::cmp::min;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, RwLock};
+use rand::{ThreadRng, Rng};
 use wayland_client::EnvHandler;
 use wayland_client::protocol::{wl_compositor, wl_pointer, wl_seat, wl_shell, wl_shell_surface,
                                wl_shm};
@@ -80,22 +80,9 @@ fn main() {
     let pool = env.shm
         .create_pool(tmp.as_raw_fd(), (BUF_X * BUF_Y * 4) as i32);
 
-    // match a buffer on the part we wrote on
-    let buffer = pool.create_buffer(
-        0,
-        BUF_X as i32,
-        BUF_Y as i32,
-        (BUF_X * 4) as i32,
-        wl_shm::Format::Argb8888,
-    ).expect("The pool cannot be already dead");
-
     // make our surface as a toplevel one
     shell_surface.set_toplevel();
-    // attach the buffer to it
-    surface.attach(Some(&buffer), 0, 0);
-    // commit
-    surface.commit();
-
+    
     let pointer = env.seat
         .get_pointer()
         .expect("Seat cannot be already destroyed.");
@@ -105,15 +92,27 @@ fn main() {
     event_queue.register(&shell_surface, shell_surface_impl(), ());
     event_queue.register(&pointer, pointer_impl(), app_state.clone());
 
+    let mut rng = rand::thread_rng();
 
     loop {
-        draw(&app_state, &mut tmp);
+        draw(&app_state, &mut tmp, &mut rng);
+
+        let buffer = pool.create_buffer(
+            0,
+            BUF_X as i32,
+            BUF_Y as i32,
+            (BUF_X * 4) as i32,
+            wl_shm::Format::Argb8888,
+        ).expect("The pool cannot be already dead");
+
+        surface.attach(Some(&buffer), 0, 0);
+        surface.commit();
         display.flush().expect("Error flushing display");
         event_queue.dispatch().expect("Event queue dispatch failed");
     }
 }
 
-fn draw(app_state: &ArcRwlAppState, tmp: &mut File) {
+fn draw(app_state: &ArcRwlAppState, tmp: &mut File, rng: &mut ThreadRng) {
     use std::io::{Seek, SeekFrom};
 
     let readable_app_state = app_state.read().unwrap();
@@ -135,7 +134,7 @@ fn draw(app_state: &ArcRwlAppState, tmp: &mut File) {
         let x = (i % BUF_X) as u32;
         let y = (i / BUF_Y) as u32;
 
-        let mut r = 0u32;
+        let mut r = rng.gen::<u8>() as u32;
         let mut g = 0u32;
         let mut b = 0u32;
 
