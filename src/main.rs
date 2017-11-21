@@ -107,6 +107,8 @@ fn main() {
 
         surface.attach(Some(&buffer), 0, 0);
         surface.commit();
+        surface.damage_buffer(0, 0, BUF_X as i32, BUF_Y as i32).expect("Failed to damage buffer");
+
         display.flush().expect("Error flushing display");
         event_queue.dispatch().expect("Event queue dispatch failed");
     }
