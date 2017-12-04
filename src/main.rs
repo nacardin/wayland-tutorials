@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock};
 use rand::{ThreadRng, Rng};
 use wayland_client::EnvHandler;
 use wayland_client::protocol::{wl_compositor, wl_pointer, wl_seat, wl_shell, wl_shell_surface,
-                               wl_shm, wl_keyboard};
+                               wl_shm, wl_keyboard, wl_surface, wl_callback};
 
 // buffer (and window) width and height
 const BUF_X: u32 = 640;
@@ -38,13 +38,14 @@ struct Rect {
 // object we will pass around between draw loop and user input handlers
 struct AppState {
     rect: Rect,
+    tmp_file: File
 }
 
 // Atomic reference cell and reader-writer lock to safely share AppState
 type ArcRwlAppState = Arc<RwLock<AppState>>;
 
 impl AppState {
-    fn new() -> ArcRwlAppState {
+    fn new(tmp_file: File) -> ArcRwlAppState {
         Arc::new(RwLock::new(AppState {
             rect: Rect {
                 x: 0,
@@ -52,6 +53,7 @@ impl AppState {
                 w: 50,
                 h: 50,
             },
+            tmp_file: tmp_file
         }))
     }
 }
@@ -105,34 +107,41 @@ fn main() {
         .get_keyboard()
         .expect("Seat cannot be already destroyed.");
 
-    let app_state = AppState::new();
+    let app_state = AppState::new(tmp);
 
     event_queue.register(&shell_surface, create_shell_surface_event_hander(), ());
     event_queue.register(&pointer, create_pointer_event_hander(), app_state.clone());
     event_queue.register(&keyboard, create_keyboard_event_hander(), app_state.clone());
 
     // use random number generator to create background noise, to know when a frame has been rendered
-    let mut rng = rand::thread_rng();
+    // let mut rng = rand::thread_rng();
+
+draw(&app_state);
 
     // infinite loop to draw and receive user input
     loop {
-        draw(&app_state, &mut tmp, &mut rng);
 
         surface.attach(Some(&buffer), 0, 0);
-        surface.commit();
         surface.damage_buffer(0, 0, BUF_X as i32, BUF_Y as i32).expect("Failed to damage buffer");
+        surface.commit();
 
         display.flush().expect("Error flushing display");
+
+        let frame_cb = surface.frame().expect("unable to request frame hint");
+        event_queue.register(&frame_cb, create_callback_event_hander(), app_state.clone());
+
         event_queue.dispatch().expect("Event queue dispatch failed");
     }
 }
 
 // application draw logic to run on each frame
-fn draw(app_state: &ArcRwlAppState, tmp: &mut File, rng: &mut ThreadRng) {
+fn draw(app_state: &ArcRwlAppState) {
     use std::io::{Seek, SeekFrom};
 
     // get AppState from lock, using read() as to not block other readers
     let readable_app_state = app_state.read().unwrap();
+
+    let mut tmp = &readable_app_state.tmp_file;
 
     println!(
         "Rect moved to ({},{}).",
@@ -148,23 +157,35 @@ fn draw(app_state: &ArcRwlAppState, tmp: &mut File, rng: &mut ThreadRng) {
         i > rect.x && i < rect.x + rect.w && j > rect.y && j < rect.y + rect.h
     }
 
+    // let bg_color = rng.gen::<u8>() as u32;
+    let bg_color = 0u8;
+
+    let mut pixels: Vec<u8> = Vec::new();
+    pixels.reserve_exact(BUF_X as usize * BUF_Y as usize);
+
     // draw random pixels into buffer, white pixel inside Rect based on current app state
     for i in 0..(BUF_X * BUF_Y) {
         let x = (i % BUF_X) as u32;
         let y = (i / BUF_Y) as u32;
 
-        let mut r = rng.gen::<u8>() as u32;
-        let mut g = rng.gen::<u8>() as u32;
-        let mut b = rng.gen::<u8>() as u32;
+        let mut r = bg_color;
+        let mut g = bg_color;
+        let mut b = bg_color;
 
         if is_coords_in_rect(&readable_app_state.rect, x, y) {
             r = 255;
             g = 255;
             b = 255;
         }
-        tmp.write_u32::<NativeEndian>((0xFF << 24) + (r << 16) + (g << 8) + b)
-            .unwrap();
+        // pixels.push((0xFF << 24) + (r << 16) + (g << 8) + b);
+        pixels.push(0xFF);
+        pixels.push(r);
+        pixels.push(g);
+        pixels.push(b);
+        // tmp.write_u32::<NativeEndian>((0xFF << 24) + (r << 16) + (g << 8) + b)
+        //     .unwrap();
     }
+    tmp.write_all(pixels.as_slice());
     tmp.flush().unwrap();
 }
 
@@ -175,6 +196,14 @@ fn create_shell_surface_event_hander() -> wl_shell_surface::Implementation<()> {
         },
         configure: |_, _, _, _, _, _| { /* not used in this example */ },
         popup_done: |_, _, _| { /* not used in this example */ },
+    }
+}
+
+fn create_callback_event_hander() -> wl_callback::Implementation<ArcRwlAppState> {
+    wl_callback::Implementation {
+        done: |_, app_state, wl_callback, callback_data| {
+            draw(app_state);
+        },
     }
 }
 
@@ -207,7 +236,7 @@ fn create_pointer_event_hander() -> wl_pointer::Implementation<ArcRwlAppState> {
                 state
             );
         },
-        axis: |_, _, _, _, _, _| { /* not used in this example */ },
+        axis: |_, _, _, _, _, _| {},
         frame: |_, _, _| { /* not used in this example */ },
         axis_source: |_, _, _, _| { /* not used in this example */ },
         axis_discrete: |_, _, _, _, _| { /* not used in this example */ },
@@ -217,15 +246,9 @@ fn create_pointer_event_hander() -> wl_pointer::Implementation<ArcRwlAppState> {
 
 fn create_keyboard_event_hander() -> wl_keyboard::Implementation<ArcRwlAppState> {
     wl_keyboard::Implementation::<ArcRwlAppState> {
-        keymap: |_, _, _keyboard, _serial, _surface, keys| {
-            /* not used in this example */
-        },
-        enter: |_, _, _keyboard, _serial, _surface, keys| {
-            /* not used in this example */
-        },
-        leave: |_, _, _keyboard, _serial, _surface | {
-            /* not used in this example */
-        },
+        keymap: |_, _, _keyboard, _serial, _surface, keys| {}, /* not used in this example */
+        enter: |_, _, _keyboard, _serial, _surface, keys| {}, /* not used in this example */
+        leave: |_, _, _keyboard, _serial, _surface | {},  /* not used in this example */
         key: |_, app_state, _keyboard, _serial, _time, key, state| {
             use wl_keyboard::KeyState;
 
@@ -250,11 +273,7 @@ fn create_keyboard_event_hander() -> wl_keyboard::Implementation<ArcRwlAppState>
 
             println!("Key {} was {:?}.", key, state);
         },
-        modifiers: |_, _, _keyboard, _serial, mods_depressed, mods_latched, mods_locked, group| {
-            /* not used in this example */
-        },
-        repeat_info: |_, _, _keyboard, _serial, _surface| {
-            /* not used in this example */
-        }
+        modifiers: |_, _, _keyboard, _serial, mods_depressed, mods_latched, mods_locked, group| {},
+        repeat_info: |_, _, _keyboard, _serial, _surface| {}
     }
 }
