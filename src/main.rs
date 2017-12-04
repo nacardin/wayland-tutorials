@@ -12,12 +12,13 @@ use std::sync::{Arc, RwLock};
 use rand::{ThreadRng, Rng};
 use wayland_client::EnvHandler;
 use wayland_client::protocol::{wl_compositor, wl_pointer, wl_seat, wl_shell, wl_shell_surface,
-                               wl_shm};
+                               wl_shm, wl_keyboard};
 
 // buffer (and window) width and height
-const BUF_X: u32 = 320;
-const BUF_Y: u32 = 240;
+const BUF_X: u32 = 640;
+const BUF_Y: u32 = 480;
 
+// get references to wayland globals
 wayland_env!(
     WaylandEnvironment,
     compositor: wl_compositor::WlCompositor,
@@ -26,6 +27,7 @@ wayland_env!(
     shm: wl_shm::WlShm
 );
 
+// represents white rectangle which moves based on user input
 struct Rect {
     x: u32,
     y: u32,
@@ -33,10 +35,12 @@ struct Rect {
     h: u32,
 }
 
+// object we will pass around between draw loop and user input handlers
 struct AppState {
     rect: Rect,
 }
 
+// Atomic reference cell and reader-writer lock to safely share AppState
 type ArcRwlAppState = Arc<RwLock<AppState>>;
 
 impl AppState {
@@ -53,6 +57,7 @@ impl AppState {
 }
 
 fn main() {
+
     // Connect to wayland server
     let (display, mut event_queue) =
         wayland_client::default_connect().expect("Cannot connect to wayland server");
@@ -66,6 +71,7 @@ fn main() {
         .sync_roundtrip()
         .expect("Failed to sync with wayland server");
 
+    // creates a tempfile to use as a shared buffer beetween this app and the wayland compositor
     let mut tmp = tempfile::tempfile().expect("Unable to create a tempfile.");
 
     let env = event_queue
@@ -80,6 +86,14 @@ fn main() {
     let pool = env.shm
         .create_pool(tmp.as_raw_fd(), (BUF_X * BUF_Y * 4) as i32);
 
+    let buffer = pool.create_buffer(
+        0,
+        BUF_X as i32,
+        BUF_Y as i32,
+        (BUF_X * 4) as i32,
+        wl_shm::Format::Argb8888,
+    ).expect("The pool cannot be already dead");
+
     // make our surface as a toplevel one
     shell_surface.set_toplevel();
     
@@ -87,23 +101,22 @@ fn main() {
         .get_pointer()
         .expect("Seat cannot be already destroyed.");
 
+    let keyboard = env.seat
+        .get_keyboard()
+        .expect("Seat cannot be already destroyed.");
+
     let app_state = AppState::new();
 
-    event_queue.register(&shell_surface, shell_surface_impl(), ());
-    event_queue.register(&pointer, pointer_impl(), app_state.clone());
+    event_queue.register(&shell_surface, create_shell_surface_event_hander(), ());
+    event_queue.register(&pointer, create_pointer_event_hander(), app_state.clone());
+    event_queue.register(&keyboard, create_keyboard_event_hander(), app_state.clone());
 
+    // use random number generator to create background noise, to know when a frame has been rendered
     let mut rng = rand::thread_rng();
 
+    // infinite loop to draw and receive user input
     loop {
         draw(&app_state, &mut tmp, &mut rng);
-
-        let buffer = pool.create_buffer(
-            0,
-            BUF_X as i32,
-            BUF_Y as i32,
-            (BUF_X * 4) as i32,
-            wl_shm::Format::Argb8888,
-        ).expect("The pool cannot be already dead");
 
         surface.attach(Some(&buffer), 0, 0);
         surface.commit();
@@ -114,9 +127,11 @@ fn main() {
     }
 }
 
+// application draw logic to run on each frame
 fn draw(app_state: &ArcRwlAppState, tmp: &mut File, rng: &mut ThreadRng) {
     use std::io::{Seek, SeekFrom};
 
+    // get AppState from lock, using read() as to not block other readers
     let readable_app_state = app_state.read().unwrap();
 
     println!(
@@ -125,20 +140,22 @@ fn draw(app_state: &ArcRwlAppState, tmp: &mut File, rng: &mut ThreadRng) {
         readable_app_state.rect.y
     );
 
+    // go to start of buffer
     tmp.seek(SeekFrom::Start(0)).unwrap();
 
+    // check if pixel in within rectangle
     fn is_coords_in_rect(rect: &Rect, i: u32, j: u32) -> bool {
         i > rect.x && i < rect.x + rect.w && j > rect.y && j < rect.y + rect.h
     }
 
-    // write the contents to it, lets put a nice color gradient
+    // draw random pixels into buffer, white pixel inside Rect based on current app state
     for i in 0..(BUF_X * BUF_Y) {
         let x = (i % BUF_X) as u32;
         let y = (i / BUF_Y) as u32;
 
         let mut r = rng.gen::<u8>() as u32;
-        let mut g = 0u32;
-        let mut b = 0u32;
+        let mut g = rng.gen::<u8>() as u32;
+        let mut b = rng.gen::<u8>() as u32;
 
         if is_coords_in_rect(&readable_app_state.rect, x, y) {
             r = 255;
@@ -151,7 +168,7 @@ fn draw(app_state: &ArcRwlAppState, tmp: &mut File, rng: &mut ThreadRng) {
     tmp.flush().unwrap();
 }
 
-fn shell_surface_impl() -> wl_shell_surface::Implementation<()> {
+fn create_shell_surface_event_hander() -> wl_shell_surface::Implementation<()> {
     wl_shell_surface::Implementation {
         ping: |_, _, shell_surface, serial| {
             shell_surface.pong(serial);
@@ -161,7 +178,7 @@ fn shell_surface_impl() -> wl_shell_surface::Implementation<()> {
     }
 }
 
-fn pointer_impl() -> wl_pointer::Implementation<ArcRwlAppState> {
+fn create_pointer_event_hander() -> wl_pointer::Implementation<ArcRwlAppState> {
     wl_pointer::Implementation::<ArcRwlAppState> {
         enter: |_, _, _pointer, _serial, _surface, x, y| {
             println!("Pointer entered surface at ({},{}).", x, y);
@@ -172,6 +189,7 @@ fn pointer_impl() -> wl_pointer::Implementation<ArcRwlAppState> {
         motion: |_, app_state, _pointer, _time, x, y| {
             println!("Pointer moved to ({},{}).", x, y);
 
+            // sets Rect's top-left coordinates to that of the pointer
             let mut writable_app_state = app_state.write().unwrap();
             writable_app_state.rect.x = x as u32;
             writable_app_state.rect.y = y as u32;
@@ -194,5 +212,49 @@ fn pointer_impl() -> wl_pointer::Implementation<ArcRwlAppState> {
         axis_source: |_, _, _, _| { /* not used in this example */ },
         axis_discrete: |_, _, _, _, _| { /* not used in this example */ },
         axis_stop: |_, _, _, _, _| { /* not used in this example */ },
+    }
+}
+
+fn create_keyboard_event_hander() -> wl_keyboard::Implementation<ArcRwlAppState> {
+    wl_keyboard::Implementation::<ArcRwlAppState> {
+        keymap: |_, _, _keyboard, _serial, _surface, keys| {
+            /* not used in this example */
+        },
+        enter: |_, _, _keyboard, _serial, _surface, keys| {
+            /* not used in this example */
+        },
+        leave: |_, _, _keyboard, _serial, _surface | {
+            /* not used in this example */
+        },
+        key: |_, app_state, _keyboard, _serial, _time, key, state| {
+            use wl_keyboard::KeyState;
+
+            let mut writable_app_state = app_state.write().unwrap();
+
+            // update rect coordinates based on keyboard arrow keys
+            match (state, key) {
+                (KeyState::Released, 103) => {
+                    writable_app_state.rect.y = writable_app_state.rect.y - 5;
+                },
+                (KeyState::Released, 108) => {
+                    writable_app_state.rect.y = writable_app_state.rect.y + 5;
+                },
+                (KeyState::Released, 105) => {
+                    writable_app_state.rect.x = writable_app_state.rect.x - 5;
+                },
+                (KeyState::Released, 106) => {
+                    writable_app_state.rect.x = writable_app_state.rect.x + 5;
+                }
+                _ => ()
+            };
+
+            println!("Key {} was {:?}.", key, state);
+        },
+        modifiers: |_, _, _keyboard, _serial, mods_depressed, mods_latched, mods_locked, group| {
+            /* not used in this example */
+        },
+        repeat_info: |_, _, _keyboard, _serial, _surface| {
+            /* not used in this example */
+        }
     }
 }
